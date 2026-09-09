@@ -59,6 +59,20 @@ def run_health_server():
         logger.warning(f"Web sunucusu baslatilamadi: {e}")
 
 
+def run_self_ping_loop():
+    """Render'ın 15 dakikalık uyku moduna geçmesini önlemek için her 10 dakikada bir kendi kendine ping atar."""
+    time.sleep(30)
+    while True:
+        url = os.getenv("RENDER_EXTERNAL_URL", "https://kripto-bot-hbos.onrender.com")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "SelfPinger/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                logger.info(f"Kendi kendine ping başarılı (HTTP {resp.status}) - Uyku modu engellendi.")
+        except Exception as e:
+            logger.warning(f"Self-ping uyarısı: {e}")
+        time.sleep(600)  # Her 10 dakikada bir (15 dk sınırının altında)
+
+
 def load_last_prices() -> dict:
     if LAST_PRICES_FILE.exists():
         try:
@@ -279,8 +293,9 @@ def main():
             print("Lütfen bota (/start) gönderdikten sonra veya .env dosyasına Chat ID yazıp tekrar çalıştırın.\n")
             sys.exit(1)
 
-    # Bulut / Render sağlık sunucusunu arka planda başlat
+    # Bulut / Render sağlık sunucusunu ve otomatik uyku önleyici pingi başlat
     threading.Thread(target=run_health_server, daemon=True).start()
+    threading.Thread(target=run_self_ping_loop, daemon=True).start()
 
     logger.info(f"POLIS URL: {POLIS_URL}")
     logger.info(f"ATLAS URL: {ATLAS_URL}")
