@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import time
+import json
 import urllib.request
 import urllib.error
 import logging
@@ -29,82 +30,87 @@ DEFAULT_URL = "https://dex.coinmarketcap.com/token/solana/poLisWXnNRwC6oBu1vHiuK
 
 def fetch_cmc_dex_data(url: str = DEFAULT_URL, max_retries: int = 3) -> Optional[Dict[str, Any]]:
     """
-    CoinMarketCap DEX sayfasından POLIS token verilerini çeker ve ayrıştırır.
+    POLIS ve ATLAS token verilerini ceker:
+    1. DexScreener API (Guvenilir on-chain Solana DEX verisi, Cloudflare takilmaz, kesintisiz calisir)
+    2. CoinMarketCap DEX __NEXT_DATA__ JSON (Yedek kaynak)
     """
-    html_content = None
+    addr = url.rstrip("/").split("/")[-1]
+
+    # --- 1. DexScreener API (Birincil ve Hizli Cozum) ---
+    for attempt in range(1, max_retries + 1):
+        try:
+            api_url = f"https://api.dexscreener.com/latest/dex/tokens/{addr}"
+            req = urllib.request.Request(api_url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    pairs = data.get("pairs") or []
+                    if pairs:
+                        # En yuksek likiditeye sahip ana havuzu sec (Raydium / Orca)
+                        pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0), reverse=True)
+                        top = pairs[0]
+                        price = top.get("priceUsd")
+                        change = top.get("priceChange", {}).get("h24")
+                        symbol = top.get("baseToken", {}).get("symbol", "TOKEN")
+                        if price:
+                            return {
+                                "token": symbol,
+                                "chain": "Solana",
+                                "price": f"${price}",
+                                "change_24h": f"{change}%" if change is not None else "0%",
+                                "is_positive": float(change or 0) >= 0,
+                                "market_cap": "N/A",
+                                "liquidity": "N/A",
+                                "volume_24h": "N/A",
+                                "url": url,
+                                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                            }
+        except Exception as e:
+            logger.warning(f"DexScreener deneme {attempt} ({addr}): {e}")
+            if attempt < max_retries:
+                time.sleep(1)
+
+    # --- 2. CoinMarketCap DEX __NEXT_DATA__ JSON (Yedek) ---
     for attempt in range(1, max_retries + 1):
         try:
             req = urllib.request.Request(url, headers=HEADERS)
             with urllib.request.urlopen(req, timeout=12) as resp:
                 if resp.status == 200:
                     html_content = resp.read().decode("utf-8", errors="ignore")
-                    break
-                else:
-                    logger.warning(f"Deneme {attempt}: HTTP {resp.status} döndü.")
+                    m = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html_content, re.DOTALL)
+                    if m:
+                        ndata = json.loads(m.group(1))
+                        queries = ndata.get("props", {}).get("pageProps", {}).get("dehydratedState", {}).get("queries", [])
+                        for q in queries:
+                            k = q.get("queryKey", [])
+                            if isinstance(k, list) and len(k) > 2 and k[0] == "dex-token-info":
+                                tdata = q.get("state", {}).get("data", {})
+                                p = tdata.get("p")
+                                sym = tdata.get("sym")
+                                if p:
+                                    return {
+                                        "token": sym,
+                                        "chain": "Solana",
+                                        "price": f"${p}",
+                                        "change_24h": "0%",
+                                        "is_positive": True,
+                                        "market_cap": "N/A",
+                                        "liquidity": "N/A",
+                                        "volume_24h": "N/A",
+                                        "url": url,
+                                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                                    }
         except Exception as e:
-            logger.warning(f"Deneme {attempt}: Bağlantı hatası - {e}")
+            logger.warning(f"CoinMarketCap deneme {attempt} ({url}): {e}")
             if attempt < max_retries:
-                time.sleep(2 * attempt)
+                time.sleep(1)
 
-    if not html_content:
-        logger.error("CoinMarketCap DEX sayfası çekilemedi.")
-        return None
-
-    # Fiyat Ayrıştırma
-    price_m = re.search(r'class=\"[^\"]*TopStats_price[^\"]*\">.*?(\$[\d\.,]+)', html_content, re.DOTALL)
-    if not price_m:
-        # Alternatif desen
-        price_m = re.search(r'TopStats_price.*?(\$[\d\.,]+)', html_content, re.DOTALL)
-    price = price_m.group(1) if price_m else None
-
-    # 24s Değişim Ayrıştırma
-    change_m = re.search(r'TopStats_percentageChange.*?href=\"#(caret-(?:up|down))\".*?([0-9\.]+\%)', html_content, re.DOTALL)
-    if change_m:
-        is_up = "up" in change_m.group(1).lower()
-        direction_sign = "+" if is_up else "-"
-        change_pct = f"{direction_sign}{change_m.group(2)}"
-        is_positive = is_up
-    else:
-        # Caret olmadan sadece yüzde
-        simple_change = re.search(r'TopStats_percentageChange.*?([0-9\.]+\%)', html_content, re.DOTALL)
-        change_pct = simple_change.group(1) if simple_change else "N/A"
-        is_positive = True
-
-    # Piyasa Değeri (Market Cap)
-    mc_m = re.search(r'MarketCapSelector_value.*?(\$[\d\.,]+[KMBkmb]?)', html_content, re.DOTALL)
-    market_cap = mc_m.group(1) if mc_m else "N/A"
-
-    # Likidite (Liquidity)
-    liq_m = re.search(r'Liquidity.*?TopStats_liquidityValue.*?(\$[\d\.,]+[KMBkmb]?)', html_content, re.DOTALL)
-    liquidity = liq_m.group(1) if liq_m else "N/A"
-
-    # 24s Hacim (24h Volume)
-    vol_m = re.search(r'24h Volume.*?(\$[\d\.,]+[KMBkmb]?)', html_content, re.DOTALL)
-    volume_24h = vol_m.group(1) if vol_m else "N/A"
-
-    if not price:
-        logger.error("Fiyat bilgisi sayfada tespit edilemedi.")
-        return None
-
-    return {
-        "token": "POLIS",
-        "chain": "Solana",
-        "price": price,
-        "change_24h": change_pct,
-        "is_positive": is_positive,
-        "market_cap": market_cap,
-        "liquidity": liquidity,
-        "volume_24h": volume_24h,
-        "url": url,
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
+    logger.error(f"Fiyat bilgisi cekilemedi: {url}")
+    return None
 
 if __name__ == "__main__":
-    print("CoinMarketCap DEX verisi çekiliyor...")
-    data = fetch_cmc_dex_data()
-    if data:
-        print("\n=== ÇEKİLEN VERİLER ===")
-        for k, v in data.items():
-            print(f"{k}: {v}")
-    else:
-        print("Veri çekilemedi!")
+    print("POLIS ve ATLAS verileri cekiliyor...")
+    p = fetch_cmc_dex_data("https://dex.coinmarketcap.com/token/solana/poLisWXnNRwC6oBu1vHiuKQzFjGL4XDSu4g9qjz9qVk/")
+    a = fetch_cmc_dex_data("https://dex.coinmarketcap.com/token/solana/ATLASXmbPQxBUYbxPsV97usA3fPQYEqzQBUHgiFCUsXx/")
+    print("\nPOLIS:", p)
+    print("ATLAS:", a)
